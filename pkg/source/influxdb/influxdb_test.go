@@ -133,18 +133,23 @@ func TestBuildSQLQuery(t *testing.T) {
 	end := time.Date(2024, 6, 1, 0, 0, 0, 0, time.UTC)
 
 	t.Run("basic query", func(t *testing.T) {
-		query := buildSQLQuery("cpu_usage", start, end, 0)
+		query := buildSQLQuery("cpu_usage", start, end, true, 0)
 		assert.Equal(t, `SELECT * FROM "cpu_usage" WHERE time >= '2024-01-01T00:00:00Z' AND time <= '2024-06-01T00:00:00Z' ORDER BY time ASC`, query)
 	})
 
 	t.Run("with limit", func(t *testing.T) {
-		query := buildSQLQuery("cpu_usage", start, end, 100)
+		query := buildSQLQuery("cpu_usage", start, end, true, 100)
 		assert.Contains(t, query, "LIMIT 100")
 	})
 
 	t.Run("escapes double quotes in measurement name", func(t *testing.T) {
-		query := buildSQLQuery(`my"table`, start, end, 0)
+		query := buildSQLQuery(`my"table`, start, end, true, 0)
 		assert.Contains(t, query, `"my\"table"`)
+	})
+
+	t.Run("non-final window has exclusive end", func(t *testing.T) {
+		query := buildSQLQuery("cpu_usage", start, end, false, 0)
+		assert.Contains(t, query, "time < '2024-06-01T00:00:00Z'")
 	})
 }
 
@@ -153,28 +158,81 @@ func TestBuildFluxQuery(t *testing.T) {
 	end := time.Date(2024, 6, 1, 0, 0, 0, 0, time.UTC)
 
 	t.Run("basic query", func(t *testing.T) {
-		query := buildFluxQuery("my-bucket", "cpu", start, end, 0)
+		query := buildFluxQuery("my-bucket", "cpu", start, end, true, 0)
 		assert.Contains(t, query, `from(bucket: "my-bucket")`)
 		assert.Contains(t, query, `range(start: 2024-01-01T00:00:00Z`)
 		assert.Contains(t, query, `r._measurement == "cpu"`)
 	})
 
 	t.Run("stop is exclusive so adds 1 second", func(t *testing.T) {
-		query := buildFluxQuery("b", "m", start, end, 0)
+		query := buildFluxQuery("b", "m", start, end, true, 0)
 		// Flux stop should be end + 1s to make it inclusive
 		assert.Contains(t, query, "stop: 2024-06-01T00:00:01Z")
 	})
 
 	t.Run("with limit", func(t *testing.T) {
-		query := buildFluxQuery("b", "m", start, end, 50)
+		query := buildFluxQuery("b", "m", start, end, true, 50)
 		assert.Contains(t, query, "limit(n: 50)")
 	})
 
 	t.Run("escapes double quotes", func(t *testing.T) {
-		query := buildFluxQuery(`my"bucket`, `my"measurement`, start, end, 0)
+		query := buildFluxQuery(`my"bucket`, `my"measurement`, start, end, true, 0)
 		assert.Contains(t, query, `my\"bucket`)
 		assert.Contains(t, query, `my\"measurement`)
 	})
+
+	t.Run("non-final window stop is not extended", func(t *testing.T) {
+		query := buildFluxQuery("b", "m", start, end, false, 0)
+		assert.Contains(t, query, "stop: 2024-06-01T00:00:00Z)")
+	})
+}
+
+func TestSplitTimeRange(t *testing.T) {
+	start := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	t.Run("range shorter than step", func(t *testing.T) {
+		end := start.Add(3 * time.Hour)
+		assert.Equal(t, []timeWindow{{start: start, end: end, last: true}}, splitTimeRange(start, end, 24*time.Hour))
+	})
+
+	t.Run("contiguous windows with a partial final window", func(t *testing.T) {
+		end := start.Add(50 * time.Hour)
+		assert.Equal(t, []timeWindow{
+			{start: start, end: start.Add(24 * time.Hour)},
+			{start: start.Add(24 * time.Hour), end: start.Add(48 * time.Hour)},
+			{start: start.Add(48 * time.Hour), end: end, last: true},
+		}, splitTimeRange(start, end, 24*time.Hour))
+	})
+}
+
+func TestParseChunkInterval(t *testing.T) {
+	base := "influxdb://host?token=t&org=o&bucket=b"
+
+	d, err := parseChunkInterval(base)
+	require.NoError(t, err)
+	assert.Equal(t, defaultChunkInterval, d)
+
+	d, err = parseChunkInterval(base + "&chunk_interval=6h")
+	require.NoError(t, err)
+	assert.Equal(t, 6*time.Hour, d)
+
+	_, err = parseChunkInterval(base + "&chunk_interval=abc")
+	require.Error(t, err)
+	_, err = parseChunkInterval(base + "&chunk_interval=500ms")
+	require.Error(t, err)
+}
+
+func TestRemainingLimit(t *testing.T) {
+	limit, ok := remainingLimit(0, 1000)
+	assert.True(t, ok)
+	assert.Equal(t, 0, limit)
+
+	limit, ok = remainingLimit(100, 40)
+	assert.True(t, ok)
+	assert.Equal(t, 60, limit)
+
+	_, ok = remainingLimit(100, 100)
+	assert.False(t, ok)
 }
 
 func TestGetTable_StrategyLogic(t *testing.T) {

@@ -16,6 +16,7 @@ URI parameters:
 - `org`: Name of the organization.
 - `bucket`: Bucket that stores the measurements.
 - `secure`: Optional. Use HTTPS when `true` (default) or HTTP when `false`.
+- `chunk_interval`: Optional. The time range is read with one query per window of this size, e.g. `6h`. Defaults to `24h`. Lower it if queries over large measurements time out.
 
 The `<measurement>` name should be provided as the value for `--source-table`.
 
