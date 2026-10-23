@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/bruin-data/ingestr/internal/output"
+	"github.com/bruin-data/ingestr/internal/timescaledb"
 	"github.com/bruin-data/ingestr/pkg/schema"
 )
 
@@ -188,7 +189,7 @@ func (c *IngestConfig) EffectiveDestinationParallelism() int {
 
 func isPostgresURI(uri string) bool {
 	scheme, _, _ := strings.Cut(strings.ToLower(uri), "://")
-	return scheme == "postgres" || scheme == "postgresql" || scheme == "postgresql+psycopg2"
+	return scheme == "postgres" || scheme == "postgresql" || scheme == "postgresql+psycopg2" || timescaledb.IsScheme(scheme)
 }
 
 func DefaultConfig() *IngestConfig {

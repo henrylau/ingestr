@@ -7,4 +7,8 @@ func init() {
 		[]string{"postgres", "postgresql", "postgresql+psycopg2"},
 		func() interface{} { return NewPostgresDestination() },
 	)
+	registry.RegisterDestination(
+		[]string{"timescaledb", "timescale"},
+		func() interface{} { return NewPostgresDestination() },
+	)
 }

@@ -268,6 +268,45 @@
             </div>
           </div>
 
+          <div v-if="isTimescaleDest" class="border-t border-gray-100 mt-4 pt-4">
+            <h3 class="text-[11px] font-semibold mb-3 text-gray-400 uppercase tracking-wide">TimescaleDB</h3>
+            <div class="grid grid-cols-1 md:grid-cols-4 gap-3">
+              <div>
+                <label class="block text-xs font-medium text-gray-500 mb-1">Time Column</label>
+                <input type="text" v-model="tsTimeColumn" placeholder="recorded_at" class="w-full border border-gray-200 rounded px-2.5 py-1.5 text-sm focus:ring-1 focus:ring-gray-300 focus:border-gray-300">
+              </div>
+              <div>
+                <label class="block text-xs font-medium text-gray-500 mb-1">Chunk Interval</label>
+                <input type="text" v-model="tsChunkInterval" placeholder="1 day" class="w-full border border-gray-200 rounded px-2.5 py-1.5 text-sm focus:ring-1 focus:ring-gray-300 focus:border-gray-300">
+              </div>
+              <div>
+                <label class="block text-xs font-medium text-gray-500 mb-1">Compression Segment By</label>
+                <input type="text" v-model="tsSegmentBy" placeholder="device_id,tenant_id" class="w-full border border-gray-200 rounded px-2.5 py-1.5 text-sm focus:ring-1 focus:ring-gray-300 focus:border-gray-300">
+              </div>
+              <div>
+                <label class="block text-xs font-medium text-gray-500 mb-1">Compression Order By</label>
+                <input type="text" v-model="tsOrderBy" placeholder="recorded_at DESC" class="w-full border border-gray-200 rounded px-2.5 py-1.5 text-sm focus:ring-1 focus:ring-gray-300 focus:border-gray-300">
+              </div>
+              <div>
+                <label class="block text-xs font-medium text-gray-500 mb-1">Compress After</label>
+                <input type="text" v-model="tsCompressAfter" placeholder="7 days" class="w-full border border-gray-200 rounded px-2.5 py-1.5 text-sm focus:ring-1 focus:ring-gray-300 focus:border-gray-300">
+              </div>
+              <div>
+                <label class="block text-xs font-medium text-gray-500 mb-1">Compression</label>
+                <select v-model="tsCompress" class="w-full border border-gray-200 rounded px-2.5 py-1.5 text-sm focus:ring-1 focus:ring-gray-300 focus:border-gray-300 bg-white">
+                  <option value="">Default (policy when Compress After is set)</option>
+                  <option value="policy">Policy: background jobs compress old chunks</option>
+                  <option value="now">Now: compress completed chunks during the run (all chunks if Compress After is empty)</option>
+                  <option value="off">Off</option>
+                </select>
+              </div>
+              <div>
+                <label class="block text-xs font-medium text-gray-500 mb-1">Convert Existing Table</label>
+                <input type="checkbox" v-model="tsMigrateData" class="rounded border-gray-300 text-gray-700 focus:ring-gray-300 h-3.5 w-3.5 mt-2">
+              </div>
+            </div>
+          </div>
+
           <div class="border-t border-gray-100 mt-4 pt-4">
             <h3 class="text-[11px] font-semibold mb-3 text-gray-400 uppercase tracking-wide">Streaming and Debug</h3>
             <div class="grid grid-cols-1 md:grid-cols-4 gap-3">
@@ -458,6 +497,13 @@
         const flushInterval = ref('30s');
         const flushRecords = ref(50000);
         const queryAnnotations = ref('');
+        const tsTimeColumn = ref('');
+        const tsChunkInterval = ref('');
+        const tsSegmentBy = ref('');
+        const tsOrderBy = ref('');
+        const tsCompressAfter = ref('');
+        const tsCompress = ref('');
+        const tsMigrateData = ref(false);
 
         // Job state
         const isRunning = ref(false);
@@ -485,6 +531,10 @@
           return credentials.value.filter(c => ids.has(c.connectorId));
         });
 
+        const isTimescaleDest = computed(() => {
+          const cred = credentials.value.find(c => c.id === selectedDestCred.value);
+          return cred?.connectorId === 'timescaledb';
+        });
         const canRun = computed(() => selectedSourceCred.value && selectedDestCred.value);
         const statusClass = computed(() => ({
           'bg-amber-500/20 text-amber-400': jobStatus.value === 'running',
@@ -627,7 +677,16 @@
             stream: stream.value,
             flushInterval: stream.value ? flushInterval.value : '',
             flushRecords: stream.value ? numberOrZero(flushRecords.value) : 0,
-            queryAnnotations: queryAnnotations.value
+            queryAnnotations: queryAnnotations.value,
+            timescale: isTimescaleDest.value ? {
+              timeColumn: tsTimeColumn.value,
+              chunkInterval: tsChunkInterval.value,
+              segmentBy: tsSegmentBy.value,
+              orderBy: tsOrderBy.value,
+              compressAfter: tsCompressAfter.value,
+              compress: tsCompress.value,
+              migrateData: tsMigrateData.value
+            } : undefined
           };
 
           try {
@@ -747,6 +806,8 @@
           sqlBackend, columns, noInference, mask, trimWhitespace, noLoadTimestamp,
           pipelinesDir, stagingBucket, stagingDataset, debug, stream,
           flushInterval, flushRecords, queryAnnotations,
+          isTimescaleDest, tsTimeColumn, tsChunkInterval, tsSegmentBy, tsOrderBy,
+          tsCompressAfter, tsCompress, tsMigrateData,
           isRunning, jobId, jobStatus, logs, logContainer,
           expandedRunId, selectedRunLogs, totalRuns, runsOffset, runsPerPage,
           sourceConnectors, destConnectors, sourceCredentials, destCredentials,

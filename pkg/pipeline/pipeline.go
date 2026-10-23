@@ -20,6 +20,7 @@ import (
 	"github.com/bruin-data/ingestr/internal/display"
 	"github.com/bruin-data/ingestr/internal/metrics"
 	"github.com/bruin-data/ingestr/internal/output"
+	"github.com/bruin-data/ingestr/internal/timescaledb"
 	"github.com/bruin-data/ingestr/internal/uri"
 	"github.com/bruin-data/ingestr/pkg/databuffer"
 	"github.com/bruin-data/ingestr/pkg/destination"
@@ -943,12 +944,17 @@ func (p *Pipeline) Run(ctx context.Context) (retErr error) {
 		if err := exec.Execute(ctx, job); err != nil {
 			return fmt.Errorf("streaming ingestion failed: %w", err)
 		}
-		return nil
+		return finalizeDestinationTable(ctx, dest, p.config.DestTable)
 	}
 
 	if err := strat.Execute(ctx, job); err != nil {
 		return fmt.Errorf("ingestion failed: %w", err)
 	}
+	defer func() {
+		if retErr == nil {
+			retErr = finalizeDestinationTable(ctx, dest, p.config.DestTable)
+		}
+	}()
 	if err := source.ConnectorLeaseLoss(ctx); err != nil {
 		return err
 	}
@@ -2814,6 +2820,17 @@ func validateExtractPartitionStrategy(cfg *config.IngestConfig, resolvedStrategy
 	}
 }
 
+func finalizeDestinationTable(ctx context.Context, dest destination.Destination, table string) error {
+	finalizer, ok := dest.(destination.PostLoadFinalizer)
+	if !ok {
+		return nil
+	}
+	if err := finalizer.FinalizeTable(ctx, table); err != nil {
+		return fmt.Errorf("failed to finalize destination table: %w", err)
+	}
+	return nil
+}
+
 func usesInPlaceReplace(strat config.IncrementalStrategy, destURI string) bool {
 	if strat != config.StrategyReplace {
 		return false
@@ -2822,7 +2839,7 @@ func usesInPlaceReplace(strat config.IncrementalStrategy, destURI string) bool {
 	if err != nil {
 		return false
 	}
-	return uri.NormalizeScheme(scheme) == "postgres"
+	return uri.NormalizeScheme(scheme) == "postgres" || timescaledb.IsScheme(scheme)
 }
 
 func getWriteStrategy(strat config.IncrementalStrategy, destURI string) (strategy.WriteStrategy, error) {

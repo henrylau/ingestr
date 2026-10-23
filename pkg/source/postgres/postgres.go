@@ -13,6 +13,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/bruin-data/ingestr/internal/config"
+	"github.com/bruin-data/ingestr/internal/timescaledb"
 	"github.com/bruin-data/ingestr/pkg/schema"
 	"github.com/bruin-data/ingestr/pkg/source"
 	"github.com/jackc/pgx/v5"
@@ -36,7 +37,12 @@ func (s *PostgresSource) Schemes() []string {
 
 func (s *PostgresSource) Connect(ctx context.Context, uri string) error {
 	normalizedURI := uri
-	if strings.Contains(uri, "+") {
+	if timescaledb.IsURI(uri) {
+		var err error
+		if normalizedURI, err = timescaledb.ConnectionURI(uri); err != nil {
+			return err
+		}
+	} else if strings.Contains(uri, "+") {
 		parts := strings.SplitN(uri, "://", 2)
 		if len(parts) == 2 {
 			normalizedURI = "postgres://" + parts[1]

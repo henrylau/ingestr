@@ -195,6 +195,11 @@ func (s *Server) resolveRunRequest(req *RunJobRequest) error {
 	if req.DestURI == "" {
 		return fmt.Errorf("dest-uri is required")
 	}
+	destURI, err := applyTimescaleOptions(req.DestURI, req.Timescale)
+	if err != nil {
+		return err
+	}
+	req.DestURI = destURI
 	// A comma-separated sourceTable selects a CDC subset, whose destination
 	// tables are derived per table; copying the list here would name one
 	// nonsense table.

@@ -53,6 +53,27 @@ func GetConnectors() []ConnectorType {
 			},
 		},
 		{
+			ID:            "timescaledb",
+			Name:          "TimescaleDB",
+			Schemes:       []string{"timescaledb", "timescale"},
+			IsSource:      true,
+			IsDestination: true,
+			Fields: []ConnectorField{
+				{Name: "host", Label: "Host", Type: "string", Required: true, Placeholder: "localhost"},
+				{Name: "port", Label: "Port", Type: "number", Required: false, Default: "5432", Placeholder: "5432"},
+				{Name: "user", Label: "Username", Type: "string", Required: true, Placeholder: "postgres"},
+				{Name: "password", Label: "Password", Type: "password", Required: false},
+				{Name: "database", Label: "Database", Type: "string", Required: true, Placeholder: "mydb"},
+				{Name: "sslmode", Label: "SSL Mode", Type: "select", Required: false, Default: "prefer", Options: []FieldOption{
+					{Value: "disable", Label: "Disable"},
+					{Value: "prefer", Label: "Prefer"},
+					{Value: "require", Label: "Require"},
+					{Value: "verify-ca", Label: "Verify CA"},
+					{Value: "verify-full", Label: "Verify Full"},
+				}},
+			},
+		},
+		{
 			ID:            "mysql",
 			Name:          "MySQL",
 			Schemes:       []string{"mysql", "mysql+pymysql", "mariadb"},
@@ -481,6 +502,8 @@ func BuildURI(connectorID string, fields map[string]string) string {
 	switch connectorID {
 	case "postgres":
 		return buildStandardURI("postgres", fields, "5432")
+	case "timescaledb":
+		return buildTimescaleDBURI(fields)
 	case "mysql":
 		return buildStandardURI("mysql", fields, "3306")
 	case "vitess":
@@ -562,6 +585,27 @@ func BuildURI(connectorID string, fields map[string]string) string {
 	default:
 		return ""
 	}
+}
+
+func buildTimescaleDBURI(fields map[string]string) string {
+	port := fields["port"]
+	if port == "" {
+		port = "5432"
+	}
+	u := &url.URL{Scheme: "timescaledb", Host: fields["host"] + ":" + port}
+	if fields["password"] != "" {
+		u.User = url.UserPassword(fields["user"], fields["password"])
+	} else if fields["user"] != "" {
+		u.User = url.User(fields["user"])
+	}
+	if fields["database"] != "" {
+		u.Path = "/" + fields["database"]
+	}
+
+	if sslmode := strings.TrimSpace(fields["sslmode"]); sslmode != "" {
+		u.RawQuery = url.Values{"sslmode": {sslmode}}.Encode()
+	}
+	return u.String()
 }
 
 func buildAzureSQLURI(fields map[string]string) string {
