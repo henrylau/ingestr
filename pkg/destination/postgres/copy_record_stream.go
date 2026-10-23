@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/bruin-data/ingestr/pkg/schema"
@@ -26,6 +27,9 @@ type postgresRecordCopyStream struct {
 	trailerOffset  int
 	inputExhausted bool
 	batches        int
+	onRecord       func(arrow.RecordBatch)
+	// deadline, when set, ends the COPY once reached so its rows commit.
+	deadline time.Time
 }
 
 func newPostgresRecordCopyStream(ctx context.Context, records <-chan source.RecordBatchResult, first arrow.RecordBatch, tableSchema *schema.TableSchema, typeMap *pgtype.Map, oids []uint32, rejects *rejectedRows) (*postgresRecordCopyStream, error) {
@@ -110,12 +114,21 @@ func (s *postgresRecordCopyStream) Batches() int {
 }
 
 func (s *postgresRecordCopyStream) nextRecord() error {
+	var expired <-chan time.Time
+	if !s.deadline.IsZero() {
+		timer := time.NewTimer(time.Until(s.deadline))
+		defer timer.Stop()
+		expired = timer.C
+	}
 	for {
 		var result source.RecordBatchResult
 		var ok bool
 		select {
 		case <-s.ctx.Done():
 			return s.ctx.Err()
+		case <-expired:
+			s.inputExhausted = true
+			return nil
 		case result, ok = <-s.records:
 		}
 		if !ok {
@@ -152,6 +165,9 @@ func (s *postgresRecordCopyStream) setRecord(record arrow.RecordBatch) error {
 	s.current = reader
 	s.currentRecord = record
 	s.batches++
+	if s.onRecord != nil {
+		s.onRecord(record)
+	}
 	return nil
 }
 

@@ -1,6 +1,13 @@
 package server
 
-import "strconv"
+import (
+	"fmt"
+	"net/url"
+	"strconv"
+	"strings"
+
+	"github.com/bruin-data/ingestr/internal/timescaledb"
+)
 
 type RunJobRequest struct {
 	SourceCredentialID string `json:"sourceCredentialId"`
@@ -51,6 +58,65 @@ type RunJobRequest struct {
 	FlushInterval    string `json:"flushInterval"`
 	FlushRecords     int    `json:"flushRecords"`
 	QueryAnnotations string `json:"queryAnnotations"`
+
+	Timescale *TimescaleRunOptions `json:"timescale,omitempty"`
+}
+
+// TimescaleRunOptions are TimescaleDB destination settings chosen per run;
+// they are passed to ingestr as query parameters of the destination URI.
+type TimescaleRunOptions struct {
+	TimeColumn    string `json:"timeColumn"`
+	ChunkInterval string `json:"chunkInterval"`
+	SegmentBy     string `json:"segmentBy"`
+	OrderBy       string `json:"orderBy"`
+	CompressAfter string `json:"compressAfter"`
+	Compress      string `json:"compress"`
+	MigrateData   bool   `json:"migrateData"`
+}
+
+func (o *TimescaleRunOptions) params() map[string]string {
+	params := map[string]string{
+		"time_column":    o.TimeColumn,
+		"chunk_interval": o.ChunkInterval,
+		"segment_by":     o.SegmentBy,
+		"order_by":       o.OrderBy,
+		"compress_after": o.CompressAfter,
+		"compress":       o.Compress,
+	}
+	if o.MigrateData {
+		params["migrate_data"] = "true"
+	}
+	for key, value := range params {
+		if params[key] = strings.TrimSpace(value); params[key] == "" {
+			delete(params, key)
+		}
+	}
+	return params
+}
+
+// applyTimescaleOptions sets the run's TimescaleDB options on destURI,
+// overriding any of the same parameters already in it.
+func applyTimescaleOptions(destURI string, opts *TimescaleRunOptions) (string, error) {
+	if opts == nil {
+		return destURI, nil
+	}
+	params := opts.params()
+	if len(params) == 0 {
+		return destURI, nil
+	}
+	if !timescaledb.IsURI(destURI) {
+		return "", fmt.Errorf("timescaledb options require a timescaledb destination")
+	}
+	parsed, err := url.Parse(destURI)
+	if err != nil {
+		return "", fmt.Errorf("invalid destination uri: %w", err)
+	}
+	query := parsed.Query()
+	for key, value := range params {
+		query.Set(key, value)
+	}
+	parsed.RawQuery = query.Encode()
+	return parsed.String(), nil
 }
 
 func (r RunJobRequest) IngestArgs() []string {

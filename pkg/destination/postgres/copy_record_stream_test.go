@@ -6,6 +6,7 @@ import (
 	"io"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
@@ -124,4 +125,21 @@ func int32Record(t *testing.T, values ...int32) arrow.RecordBatch {
 
 func int32TableSchema() *schema.TableSchema {
 	return &schema.TableSchema{Columns: []schema.Column{{Name: "value", DataType: schema.TypeInt32}}}
+}
+
+func TestPostgresRecordCopyStreamEndsAtDeadline(t *testing.T) {
+	records := make(chan source.RecordBatchResult)
+	stream, err := newPostgresRecordCopyStream(t.Context(), records, int32Record(t, 1), int32TableSchema(), pgtype.NewMap(), []uint32{pgtype.Int4OID}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stream.Close()
+	stream.deadline = time.Now().Add(50 * time.Millisecond)
+
+	if _, err := io.Copy(io.Discard, stream); err != nil {
+		t.Fatal(err)
+	}
+	if stream.Batches() != 1 || stream.Pending() != nil {
+		t.Fatalf("batches = %d, pending = %v; want the COPY to end with only the first batch", stream.Batches(), stream.Pending())
+	}
 }

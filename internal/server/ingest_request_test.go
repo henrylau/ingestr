@@ -1,6 +1,7 @@
 package server
 
 import (
+	"net/url"
 	"reflect"
 	"testing"
 )
@@ -95,5 +96,51 @@ func TestRunJobRequestIngestArgs(t *testing.T) {
 
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("args mismatch\n got: %#v\nwant: %#v", got, want)
+	}
+}
+
+func TestApplyTimescaleOptions(t *testing.T) {
+	got, err := applyTimescaleOptions("timescaledb://u:p@h:5432/d?sslmode=require&compress=policy", &TimescaleRunOptions{
+		TimeColumn:    " recorded_at ",
+		ChunkInterval: "1 day",
+		SegmentBy:     "device_id,tenant_id",
+		OrderBy:       "recorded_at DESC",
+		CompressAfter: "7 days",
+		Compress:      "now",
+		MigrateData:   true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := url.Parse(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := url.Values{
+		"sslmode":        {"require"},
+		"time_column":    {"recorded_at"},
+		"chunk_interval": {"1 day"},
+		"segment_by":     {"device_id,tenant_id"},
+		"order_by":       {"recorded_at DESC"},
+		"compress_after": {"7 days"},
+		"compress":       {"now"},
+		"migrate_data":   {"true"},
+	}
+	if !reflect.DeepEqual(parsed.Query(), want) {
+		t.Errorf("query = %v, want %v", parsed.Query(), want)
+	}
+	if parsed.Host != "h:5432" || parsed.Path != "/d" || parsed.User.String() != "u:p" {
+		t.Errorf("uri = %q", got)
+	}
+
+	unchanged := "duckdb:///tmp/out.db"
+	for _, opts := range []*TimescaleRunOptions{nil, {}, {TimeColumn: "  "}} {
+		if got, err := applyTimescaleOptions(unchanged, opts); err != nil || got != unchanged {
+			t.Errorf("applyTimescaleOptions(%+v) = %q, %v", opts, got, err)
+		}
+	}
+
+	if _, err := applyTimescaleOptions(unchanged, &TimescaleRunOptions{TimeColumn: "ts"}); err == nil {
+		t.Error("expected an error for a non-timescaledb destination")
 	}
 }

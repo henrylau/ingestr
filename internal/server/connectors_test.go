@@ -4,6 +4,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"strings"
 	"testing"
@@ -123,6 +124,34 @@ func TestBuildAzureSQLURI(t *testing.T) {
 	}
 	if got := query.Get("tenant_id"); got != "tenant-123" {
 		t.Errorf("tenant_id = %q, want tenant-123", got)
+	}
+}
+
+func TestBuildTimescaleDBURI(t *testing.T) {
+	uri := BuildURI("timescaledb", map[string]string{
+		"host":     "tsdb.internal",
+		"user":     "admin",
+		"password": "p@ss word",
+		"database": "metrics",
+		"sslmode":  "require",
+	})
+
+	parsed, err := url.Parse(uri)
+	if err != nil {
+		t.Fatalf("invalid URI: %v", err)
+	}
+	if parsed.Scheme != "timescaledb" || parsed.Host != "tsdb.internal:5432" || parsed.Path != "/metrics" {
+		t.Errorf("uri = %q", uri)
+	}
+	if password, _ := parsed.User.Password(); parsed.User.Username() != "admin" || password != "p@ss word" {
+		t.Errorf("user info = %q", parsed.User)
+	}
+	if got := parsed.Query(); !reflect.DeepEqual(got, url.Values{"sslmode": {"require"}}) {
+		t.Errorf("query = %v", got)
+	}
+
+	if got := BuildURI("timescaledb", map[string]string{"host": "h", "database": "d"}); got != "timescaledb://h:5432/d" {
+		t.Errorf("minimal uri = %q", got)
 	}
 }
 

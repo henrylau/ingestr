@@ -16,6 +16,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/bruin-data/ingestr/internal/arrowutil"
 	"github.com/bruin-data/ingestr/internal/config"
+	"github.com/bruin-data/ingestr/internal/timescaledb"
 	"github.com/bruin-data/ingestr/pkg/destination"
 	"github.com/bruin-data/ingestr/pkg/schema"
 	"github.com/bruin-data/ingestr/pkg/source"
@@ -36,6 +37,7 @@ type PostgresDestination struct {
 	DefaultSchema string
 
 	skipInvalidRows bool
+	timescale       *timescaleState
 }
 
 type postgresStatementDescriber interface {
@@ -73,7 +75,16 @@ func (d *PostgresDestination) Schemes() []string {
 
 func (d *PostgresDestination) Connect(ctx context.Context, uri string) error {
 	normalizedURI := uri
-	if strings.Contains(uri, "+") {
+	if timescaledb.IsURI(uri) {
+		opts, err := timescaledb.ParseOptions(uri)
+		if err != nil {
+			return err
+		}
+		if normalizedURI, err = timescaledb.ConnectionURI(uri); err != nil {
+			return err
+		}
+		d.timescale = &timescaleState{opts: opts}
+	} else if strings.Contains(uri, "+") {
 		parts := strings.SplitN(uri, "://", 2)
 		if len(parts) == 2 {
 			normalizedURI = "postgres://" + parts[1]
@@ -98,6 +109,13 @@ func (d *PostgresDestination) Connect(ctx context.Context, uri string) error {
 
 	d.pool = pool
 	d.uri = uri
+	if d.timescale != nil {
+		if err := d.checkTimescaleExtension(ctx); err != nil {
+			pool.Close()
+			d.pool = nil
+			return err
+		}
+	}
 	return nil
 }
 
@@ -121,6 +139,12 @@ func (d *PostgresDestination) PrepareTable(ctx context.Context, opts destination
 		return err
 	}
 	resolvedTable := quotePostgresTable(schemaName, tableName)
+	hypertable := d.isTimescaleHypertable(opts, schemaName)
+	if hypertable {
+		if err := validateTimescaleTable(d.timescale.opts, opts); err != nil {
+			return err
+		}
+	}
 	if err := d.ensureSchemaExists(ctx, schemaName); err != nil {
 		return fmt.Errorf("failed to ensure schema exists: %w", err)
 	}
@@ -152,6 +176,12 @@ func (d *PostgresDestination) PrepareTable(ctx context.Context, opts destination
 	if len(opts.PrimaryKeys) > 0 && (!opts.DropFirst || opts.RequirePrimaryKeyMatch) {
 		if err := d.ensurePrimaryKey(ctx, schemaName, tableName, opts.PrimaryKeys, opts.RequirePrimaryKeyMatch); err != nil {
 			return fmt.Errorf("failed to ensure primary key: %w", err)
+		}
+	}
+
+	if hypertable {
+		if err := d.ensureHypertable(ctx, schemaName, tableName); err != nil {
+			return err
 		}
 	}
 
@@ -283,6 +313,12 @@ func (d *PostgresDestination) Write(ctx context.Context, records <-chan source.R
 	copyPlans := make(postgresCopyPlanCache)
 	rejects := d.newRejectedRows()
 	defer rejects.report()
+	compressor, err := d.startChunkCompressor(ctx, opts)
+	if err != nil {
+		return err
+	}
+	defer compressor.close()
+	records = compressor.wrap(records)
 
 	for result := range records {
 		batchNum++
@@ -311,6 +347,7 @@ func (d *PostgresDestination) Write(ctx context.Context, records <-chan source.R
 		copyCount, err := d.copyRecord(ctx, record, opts, copyPlans, rejects)
 
 		record.Release()
+		compressor.settled(record)
 
 		if err != nil {
 			return fmt.Errorf("failed to copy data: %w", err)
@@ -334,6 +371,12 @@ func (d *PostgresDestination) WriteParallel(ctx context.Context, records <-chan 
 	startTotal := time.Now()
 	rejects := d.newRejectedRows()
 	defer rejects.report()
+	compressor, err := d.startChunkCompressor(ctx, opts)
+	if err != nil {
+		return err
+	}
+	defer compressor.close()
+	records = compressor.wrap(records)
 
 	type writeResult struct {
 		batchNum int
@@ -388,7 +431,7 @@ func (d *PostgresDestination) WriteParallel(ctx context.Context, records <-chan 
 				}
 
 				startBatch := time.Now()
-				copyCount, copiedBatches, next, err := d.copyRecordGroup(ctx, record, records, opts, copyPlans, rejects)
+				copyCount, copiedBatches, next, err := d.copyRecordGroup(ctx, record, records, opts, copyPlans, rejects, compressor)
 				pending = next
 				if copiedBatches > 1 {
 					atomic.AddInt64(&batchNum, int64(copiedBatches-1))
@@ -445,7 +488,7 @@ func (d *PostgresDestination) copyRecord(ctx context.Context, record arrow.Recor
 	return copyPostgresRecord(ctx, pgxConn, record, opts.Schema, plan, rejects)
 }
 
-func (d *PostgresDestination) copyRecordGroup(ctx context.Context, record arrow.RecordBatch, records <-chan source.RecordBatchResult, opts destination.WriteOptions, copyPlans postgresCopyPlanCache, rejects *rejectedRows) (int64, int, *source.RecordBatchResult, error) {
+func (d *PostgresDestination) copyRecordGroup(ctx context.Context, record arrow.RecordBatch, records <-chan source.RecordBatchResult, opts destination.WriteOptions, copyPlans postgresCopyPlanCache, rejects *rejectedRows, compressor *chunkCompressor) (int64, int, *source.RecordBatchResult, error) {
 	conn, err := d.pool.Acquire(ctx)
 	if err != nil {
 		record.Release()
@@ -462,6 +505,7 @@ func (d *PostgresDestination) copyRecordGroup(ctx context.Context, record arrow.
 	if !recordSupportsDirectPostgresCopy(record, plan.oids) {
 		defer record.Release()
 		rows, err := copyPostgresRecord(ctx, pgxConn, record, opts.Schema, plan, rejects)
+		compressor.settled(record)
 		return rows, 1, nil, err
 	}
 
@@ -470,7 +514,13 @@ func (d *PostgresDestination) copyRecordGroup(ctx context.Context, record arrow.
 		return 0, 0, nil, err
 	}
 	defer stream.Close()
+	copied := []arrow.RecordBatch{record}
+	if compressor != nil {
+		stream.onRecord = func(next arrow.RecordBatch) { copied = append(copied, next) }
+		stream.deadline = time.Now().Add(timescaleCommitInterval)
+	}
 	tag, err := pgxConn.PgConn().CopyFrom(ctx, stream, plan.copySQL)
+	compressor.settled(copied...)
 	return tag.RowsAffected(), stream.Batches(), stream.Pending(), err
 }
 

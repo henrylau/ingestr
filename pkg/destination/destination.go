@@ -256,6 +256,12 @@ type FixedStrategyDestination interface {
 	FixedStrategy(table string) string
 }
 
+// PostLoadFinalizer is implemented by destinations that run table maintenance,
+// such as TimescaleDB chunk compression, after a load has committed.
+type PostLoadFinalizer interface {
+	FinalizeTable(ctx context.Context, table string) error
+}
+
 // IncrementalPredicateSupport is implemented by destinations whose MergeTable
 // honors MergeOptions.IncrementalPredicate; others silently ignore it, so the
 // pipeline rejects the flag for them.
