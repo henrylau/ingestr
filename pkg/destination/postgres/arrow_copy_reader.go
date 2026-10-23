@@ -2,13 +2,18 @@ package postgres
 
 import (
 	"encoding/binary"
+	"fmt"
 	"io"
 	"math"
 	"math/bits"
+	"reflect"
+	"sync"
+	"sync/atomic"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/decimal128"
+	"github.com/bruin-data/ingestr/internal/output"
 	"github.com/bruin-data/ingestr/pkg/schema"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -26,16 +31,42 @@ type arrowCopyReader struct {
 	done           bool
 	includeHeader  bool
 	includeTrailer bool
+	rejects        *rejectedRows
 	err            error
+}
+
+// rejectedRows collects rows dropped under --reject-mode=skip. A nil
+// *rejectedRows means a row that cannot be encoded fails the write.
+type rejectedRows struct {
+	count  atomic.Int64
+	mu     sync.Mutex
+	sample error
+}
+
+func (r *rejectedRows) add(err error) {
+	if r.count.Add(1) == 1 {
+		r.mu.Lock()
+		r.sample = err
+		r.mu.Unlock()
+	}
+}
+
+func (r *rejectedRows) report() {
+	if r == nil || r.count.Load() == 0 {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	output.Warnf("Warning: skipped %d row(s) with values that could not be written (first error: %v)\n", r.count.Load(), r.sample)
 }
 
 type arrowCopyColumn func(int, []byte) ([]byte, bool, error)
 
-func newArrowCopyReader(record arrow.RecordBatch, tableSchema *schema.TableSchema, typeMap *pgtype.Map, oids []uint32) (*arrowCopyReader, bool) {
-	return newArrowCopyReaderWithBoundaries(record, tableSchema, typeMap, oids, true, true)
+func newArrowCopyReader(record arrow.RecordBatch, tableSchema *schema.TableSchema, typeMap *pgtype.Map, oids []uint32, rejects *rejectedRows) (*arrowCopyReader, bool) {
+	return newArrowCopyReaderWithBoundaries(record, tableSchema, typeMap, oids, true, true, rejects)
 }
 
-func newArrowCopyReaderWithBoundaries(record arrow.RecordBatch, tableSchema *schema.TableSchema, typeMap *pgtype.Map, oids []uint32, includeHeader, includeTrailer bool) (*arrowCopyReader, bool) {
+func newArrowCopyReaderWithBoundaries(record arrow.RecordBatch, tableSchema *schema.TableSchema, typeMap *pgtype.Map, oids []uint32, includeHeader, includeTrailer bool, rejects *rejectedRows) (*arrowCopyReader, bool) {
 	if len(oids) != int(record.NumCols()) {
 		return nil, false
 	}
@@ -50,31 +81,53 @@ func newArrowCopyReaderWithBoundaries(record arrow.RecordBatch, tableSchema *sch
 		if columnTypes == nil {
 			columnTypes = postgresColumnTypesByName(tableSchema)
 		}
-		get := postgresValueGetterForType(record.Column(column), columnTypes[record.ColumnName(column)])
+		name := record.ColumnName(column)
+		oid := oids[column]
+		get := postgresValueGetterForType(record.Column(column), columnTypes[name])
 
 		var plan pgtype.EncodePlan
+		var planType reflect.Type
+		sampled := false
 		for row := 0; row < int(record.NumRows()); row++ {
 			value := get(row)
 			if value == nil {
 				continue
 			}
+			sampled = true
 
-			plan = typeMap.PlanEncode(oids[column], pgx.BinaryFormatCode, value)
-			if plan == nil {
-				return nil, false
+			candidate := typeMap.PlanEncode(oid, pgx.BinaryFormatCode, value)
+			if candidate == nil {
+				continue
 			}
-			if _, err := plan.Encode(value, nil); err != nil {
-				return nil, false
+			if _, err := candidate.Encode(value, nil); err != nil {
+				continue
 			}
+			plan = candidate
+			planType = reflect.TypeOf(value)
 			break
+		}
+		if sampled && plan == nil {
+			return nil, false
 		}
 		columns[column] = func(row int, dst []byte) ([]byte, bool, error) {
 			value := get(row)
 			if value == nil {
 				return dst, true, nil
 			}
-			encoded, err := plan.Encode(value, dst)
-			return encoded, false, err
+			// A getter can return a different Go type for values it cannot convert
+			// (e.g. an invalid UUID stays a string); the sampled plan would panic on it.
+			valuePlan := plan
+			if reflect.TypeOf(value) != planType {
+				valuePlan = typeMap.PlanEncode(oid, pgx.BinaryFormatCode, value)
+				if valuePlan == nil {
+					return dst, false, fmt.Errorf("column %q: cannot encode %T value %v", name, value, value)
+				}
+			}
+			encoded, err := valuePlan.Encode(value, dst)
+			if err != nil {
+				return dst, false, fmt.Errorf("column %q: %w", name, err)
+			}
+			return encoded, false, nil
 		}
 	}
 
@@ -83,6 +136,7 @@ func newArrowCopyReaderWithBoundaries(record arrow.RecordBatch, tableSchema *sch
 		columns:        columns,
 		includeHeader:  includeHeader,
 		includeTrailer: includeTrailer,
+		rejects:        rejects,
 	}, true
 }
 
@@ -368,6 +422,7 @@ func (r *arrowCopyReader) fill(target []byte) {
 }
 
 func (r *arrowCopyReader) appendRow(row int) {
+	rowStart := len(r.buffer)
 	r.buffer = binary.BigEndian.AppendUint16(r.buffer, uint16(len(r.columns)))
 	for _, column := range r.columns {
 		lengthOffset := len(r.buffer)
@@ -375,6 +430,11 @@ func (r *arrowCopyReader) appendRow(row int) {
 
 		encoded, isNull, err := column(row, r.buffer)
 		if err != nil {
+			if r.rejects != nil {
+				r.buffer = r.buffer[:rowStart]
+				r.rejects.add(err)
+				return
+			}
 			r.err = err
 			return
 		}

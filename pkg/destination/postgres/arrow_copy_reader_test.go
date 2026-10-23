@@ -12,6 +12,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/decimal128"
 	"github.com/apache/arrow-go/v18/arrow/memory"
+	"github.com/bruin-data/ingestr/pkg/schema"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 )
@@ -52,7 +53,7 @@ func TestArrowCopyReaderTypedListValues(t *testing.T) {
 			t.Errorf("fallback row %d = %x, want %x", row, gotBytes, wantBytes)
 		}
 	}
-	reader, ok := newArrowCopyReader(record, nil, typeMap, []uint32{pgtype.Int8ArrayOID})
+	reader, ok := newArrowCopyReader(record, nil, typeMap, []uint32{pgtype.Int8ArrayOID}, nil)
 	if !ok {
 		t.Fatal("typed list rejected by COPY reader")
 	}
@@ -126,7 +127,7 @@ func TestArrowCopyReaderMatchesPGXBinaryEncoding(t *testing.T) {
 		pgtype.JSONBOID,
 	}
 	typeMap := pgtype.NewMap()
-	reader, ok := newArrowCopyReader(record, nil, typeMap, oids)
+	reader, ok := newArrowCopyReader(record, nil, typeMap, oids, nil)
 	if !ok {
 		t.Fatal("newArrowCopyReader rejected built-in PostgreSQL types")
 	}
@@ -258,13 +259,13 @@ func TestArrowCopyReaderHandlesRowsLargerThanReadBuffer(t *testing.T) {
 	)
 	defer record.Release()
 
-	smallBufferReader, ok := newArrowCopyReader(record, nil, pgtype.NewMap(), []uint32{pgtype.TextOID})
+	smallBufferReader, ok := newArrowCopyReader(record, nil, pgtype.NewMap(), []uint32{pgtype.TextOID}, nil)
 	if !ok {
 		t.Fatal("newArrowCopyReader rejected string record")
 	}
 	want := readAllWithBuffer(t, smallBufferReader, 4*1024)
 
-	directBufferReader, ok := newArrowCopyReader(record, nil, pgtype.NewMap(), []uint32{pgtype.TextOID})
+	directBufferReader, ok := newArrowCopyReader(record, nil, pgtype.NewMap(), []uint32{pgtype.TextOID}, nil)
 	if !ok {
 		t.Fatal("newArrowCopyReader rejected string record")
 	}
@@ -352,4 +353,62 @@ func buildDirectTimestampArray(mem memory.Allocator) arrow.Array {
 	}
 	builder.AppendNull()
 	return builder.NewArray()
+}
+
+func uuidRecord(t *testing.T, values ...string) arrow.RecordBatch {
+	t.Helper()
+	b := array.NewStringBuilder(memory.DefaultAllocator)
+	defer b.Release()
+	b.AppendValues(values, nil)
+	col := b.NewArray()
+	defer col.Release()
+	record := array.NewRecordBatch(arrow.NewSchema([]arrow.Field{{Name: "asset_id", Type: arrow.BinaryTypes.String}}, nil), []arrow.Array{col}, int64(len(values)))
+	t.Cleanup(record.Release)
+	return record
+}
+
+func readUUIDCopy(t *testing.T, record arrow.RecordBatch, rejects *rejectedRows) ([]byte, error) {
+	t.Helper()
+	tableSchema := &schema.TableSchema{Columns: []schema.Column{{Name: "asset_id", DataType: schema.TypeUUID}}}
+	reader, ok := newArrowCopyReader(record, tableSchema, pgtype.NewMap(), []uint32{pgtype.UUIDOID}, rejects)
+	if !ok {
+		t.Fatal("UUID column rejected by COPY reader")
+	}
+	return io.ReadAll(reader)
+}
+
+func TestArrowCopyReaderInvalidUUID(t *testing.T) {
+	const a = "0b5d8c3e-6c1f-4a8e-9d2b-1f3e5a7c9d0b"
+	const b = "7e2f4a6c-8b0d-4c1e-a3f5-9b7d1e3c5a7f"
+	want, err := readUUIDCopy(t, uuidRecord(t, a, b), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("fails with an error instead of panicking", func(t *testing.T) {
+		_, err := readUUIDCopy(t, uuidRecord(t, a, "not-a-uuid", b), nil)
+		if err == nil || !strings.Contains(err.Error(), `column "asset_id"`) {
+			t.Fatalf("error = %v, want a column encode error", err)
+		}
+	})
+
+	for name, values := range map[string][]string{
+		"skips an invalid row mid-batch": {a, "not-a-uuid", b},
+		"skips an invalid first row":     {"", a, b},
+		"skips several invalid rows":     {"x", a, "y", b, "z"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			rejects := &rejectedRows{}
+			got, err := readUUIDCopy(t, uuidRecord(t, values...), rejects)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(got, want) {
+				t.Errorf("COPY payload = %x, want only the valid rows %x", got, want)
+			}
+			if wantSkipped := int64(len(values) - 2); rejects.count.Load() != wantSkipped {
+				t.Errorf("skipped %d rows, want %d", rejects.count.Load(), wantSkipped)
+			}
+		})
+	}
 }

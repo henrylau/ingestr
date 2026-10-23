@@ -40,6 +40,15 @@ func (d *RedshiftDestination) ValidateManagedCDCState() error {
 	return errors.New("redshift does not support destination-managed CDC state")
 }
 
+// Redshift has its own write path, not the PostgreSQL COPY reader that
+// implements row skipping.
+func (d *RedshiftDestination) SetSkipInvalidRows(skip bool) error {
+	if skip {
+		return errors.New("redshift does not support --reject-mode=skip")
+	}
+	return nil
+}
+
 func (d *RedshiftDestination) Write(ctx context.Context, records <-chan source.RecordBatchResult, opts destination.WriteOptions) error {
 	for result := range records {
 		if result.Err != nil {

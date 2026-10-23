@@ -582,6 +582,12 @@ type ConnectionChecker interface {
 	CheckConnection(ctx context.Context) error
 }
 
+// InvalidRowSkipper is implemented by SQL destinations that can drop rows whose
+// values cannot be written (--reject-mode=skip) instead of failing the load.
+type InvalidRowSkipper interface {
+	SetSkipInvalidRows(skip bool) error
+}
+
 // CDCMergeAware is an optional interface that destinations can implement
 // to indicate they handle CDC deletes during merge operations.
 type CDCMergeAware interface {

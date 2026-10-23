@@ -3209,13 +3209,16 @@ func applyReverseETLNaming(dest destination.Destination, cfg *config.IngestConfi
 }
 
 // validateReverseETLFlags gates the reverse-ETL-only run flags. On a SQL
-// destination --reject-mode / --write-nulls are meaningless, so they fail fast
-// instead of being silently ignored. On a reverse-ETL destination the
-// --reject-mode value is validated for every strategy.
+// destination --write-nulls is meaningless and --reject-mode only applies to
+// destinations that can skip invalid rows, so they fail fast instead of being
+// silently ignored. On a reverse-ETL destination the --reject-mode value is
+// validated for every strategy.
 func validateReverseETLFlags(dest destination.Destination, cfg *config.IngestConfig) error {
 	if !destination.IsReverseETL(dest) {
 		if cfg.RejectMode != "" {
-			return &config.ValidationError{Field: "reject-mode", Message: fmt.Sprintf("--reject-mode is only valid for reverse-ETL destinations, not %s", dest.GetScheme())}
+			if err := applySQLRejectMode(dest, cfg.RejectMode); err != nil {
+				return err
+			}
 		}
 		if cfg.WriteNullsSet {
 			return &config.ValidationError{Field: "write-nulls", Message: fmt.Sprintf("--write-nulls is only valid for reverse-ETL destinations, not %s", dest.GetScheme())}
@@ -3246,6 +3249,22 @@ func validateReverseETLFlags(dest destination.Destination, cfg *config.IngestCon
 	default:
 		return &config.ValidationError{Field: "reject-mode", Message: fmt.Sprintf("invalid --reject-mode %q: use fail_fast, fail, or skip", cfg.RejectMode)}
 	}
+}
+
+func applySQLRejectMode(dest destination.Destination, mode config.RejectMode) error {
+	skipper, ok := dest.(destination.InvalidRowSkipper)
+	if !ok {
+		return &config.ValidationError{Field: "reject-mode", Message: fmt.Sprintf("--reject-mode is not supported for %s", dest.GetScheme())}
+	}
+	switch mode {
+	case config.RejectFailFast, config.RejectSkip:
+	default:
+		return &config.ValidationError{Field: "reject-mode", Message: fmt.Sprintf("invalid --reject-mode %q for %s: use fail_fast or skip", mode, dest.GetScheme())}
+	}
+	if err := skipper.SetSkipInvalidRows(mode == config.RejectSkip); err != nil {
+		return &config.ValidationError{Field: "reject-mode", Message: err.Error()}
+	}
+	return nil
 }
 
 // validateReverseETLColumnOverrides enforces that --columns is rename-only on a

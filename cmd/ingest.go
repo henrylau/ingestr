@@ -214,7 +214,7 @@ func IngestCommand() *cli.Command {
 			},
 			&cli.StringFlag{
 				Name:        "reject-mode",
-				Usage:       "Reverse-ETL only: how to handle rows the destination can't apply — fail_fast (stop on first), fail (write valid rows, then error with the reject list), skip (write valid rows, succeed, report rejects)",
+				Usage:       "How to handle rows the destination can't apply — fail_fast (stop on first), fail (reverse-ETL only: write valid rows, then error with the reject list), skip (write valid rows, succeed, report rejects). Reverse-ETL destinations and postgres",
 				DefaultText: "fail",
 				Sources:     cli.EnvVars("REJECT_MODE", "INGESTR_REJECT_MODE"),
 			},

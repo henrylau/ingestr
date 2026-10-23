@@ -142,15 +142,26 @@ func TestResolveTablePrimaryKeys(t *testing.T) {
 	})
 }
 
-// TestValidateReverseETLFlags covers the reverse-ETL-only run flags: rejected on
-// SQL destinations (fail fast, not silently ignored), validated on RETL ones.
+// TestValidateReverseETLFlags covers the reverse-ETL run flags: rejected on SQL
+// destinations (fail fast, not silently ignored) unless they can skip invalid
+// rows, validated on RETL ones.
 func TestValidateReverseETLFlags(t *testing.T) {
 	sqlDest := &mockDestination{scheme: "postgres"}
 	retlDest := &retlMockDestination{}
 
-	t.Run("SQL rejects --reject-mode", func(t *testing.T) {
+	t.Run("SQL without row skipping rejects --reject-mode", func(t *testing.T) {
 		err := validateReverseETLFlags(sqlDest, &config.IngestConfig{RejectMode: config.RejectSkip})
-		require.ErrorContains(t, err, "only valid for reverse-ETL")
+		require.ErrorContains(t, err, "--reject-mode is not supported for postgres")
+	})
+	t.Run("SQL with row skipping accepts fail_fast and skip", func(t *testing.T) {
+		skipDest := &skipInvalidRowsMockDestination{mockDestination: mockDestination{scheme: "postgres"}}
+		require.NoError(t, validateReverseETLFlags(skipDest, &config.IngestConfig{RejectMode: config.RejectSkip}))
+		assert.True(t, skipDest.skip)
+		require.NoError(t, validateReverseETLFlags(skipDest, &config.IngestConfig{RejectMode: config.RejectFailFast}))
+		assert.False(t, skipDest.skip)
+
+		err := validateReverseETLFlags(skipDest, &config.IngestConfig{RejectMode: config.RejectFail})
+		require.ErrorContains(t, err, "use fail_fast or skip")
 	})
 	t.Run("SQL rejects an explicit --write-nulls", func(t *testing.T) {
 		err := validateReverseETLFlags(sqlDest, &config.IngestConfig{WriteNulls: true, WriteNullsSet: true})
@@ -227,4 +238,14 @@ func TestResolveFixedStrategy(t *testing.T) {
 	got, err := resolveFixedStrategy(duckdb.NewDuckDBDestination(), &config.IngestConfig{DestTable: "t", FullRefresh: true})
 	require.NoError(t, err)
 	assert.Empty(t, got)
+}
+
+type skipInvalidRowsMockDestination struct {
+	mockDestination
+	skip bool
+}
+
+func (d *skipInvalidRowsMockDestination) SetSkipInvalidRows(skip bool) error {
+	d.skip = skip
+	return nil
 }

@@ -34,6 +34,8 @@ type PostgresDestination struct {
 	// DefaultSchema bypasses PostgreSQL catalog resolution for compatible
 	// destinations that use a fixed schema for unqualified table names.
 	DefaultSchema string
+
+	skipInvalidRows bool
 }
 
 type postgresStatementDescriber interface {
@@ -51,6 +53,18 @@ type postgresCopyPlanCache map[*arrow.Schema]*postgresCopyPlan
 
 func NewPostgresDestination() *PostgresDestination {
 	return &PostgresDestination{}
+}
+
+func (d *PostgresDestination) SetSkipInvalidRows(skip bool) error {
+	d.skipInvalidRows = skip
+	return nil
+}
+
+func (d *PostgresDestination) newRejectedRows() *rejectedRows {
+	if !d.skipInvalidRows {
+		return nil
+	}
+	return &rejectedRows{}
 }
 
 func (d *PostgresDestination) Schemes() []string {
@@ -267,6 +281,8 @@ func (d *PostgresDestination) Write(ctx context.Context, records <-chan source.R
 	totalRows := int64(0)
 	startTotal := time.Now()
 	copyPlans := make(postgresCopyPlanCache)
+	rejects := d.newRejectedRows()
+	defer rejects.report()
 
 	for result := range records {
 		batchNum++
@@ -292,7 +308,7 @@ func (d *PostgresDestination) Write(ctx context.Context, records <-chan source.R
 		config.Debug("[DEST] Batch %d: received %d rows", batchNum, numRows)
 
 		startCopy := time.Now()
-		copyCount, err := d.copyRecord(ctx, record, opts, copyPlans)
+		copyCount, err := d.copyRecord(ctx, record, opts, copyPlans, rejects)
 
 		record.Release()
 
@@ -316,6 +332,8 @@ func (d *PostgresDestination) WriteParallel(ctx context.Context, records <-chan 
 
 	config.Debug("[DEST] Starting parallel write with %d workers", parallelism)
 	startTotal := time.Now()
+	rejects := d.newRejectedRows()
+	defer rejects.report()
 
 	type writeResult struct {
 		batchNum int
@@ -370,7 +388,7 @@ func (d *PostgresDestination) WriteParallel(ctx context.Context, records <-chan 
 				}
 
 				startBatch := time.Now()
-				copyCount, copiedBatches, next, err := d.copyRecordGroup(ctx, record, records, opts, copyPlans)
+				copyCount, copiedBatches, next, err := d.copyRecordGroup(ctx, record, records, opts, copyPlans, rejects)
 				pending = next
 				if copiedBatches > 1 {
 					atomic.AddInt64(&batchNum, int64(copiedBatches-1))
@@ -412,7 +430,7 @@ func (d *PostgresDestination) WriteParallel(ctx context.Context, records <-chan 
 	return nil
 }
 
-func (d *PostgresDestination) copyRecord(ctx context.Context, record arrow.RecordBatch, opts destination.WriteOptions, copyPlans postgresCopyPlanCache) (int64, error) {
+func (d *PostgresDestination) copyRecord(ctx context.Context, record arrow.RecordBatch, opts destination.WriteOptions, copyPlans postgresCopyPlanCache, rejects *rejectedRows) (int64, error) {
 	conn, err := d.pool.Acquire(ctx)
 	if err != nil {
 		return 0, err
@@ -424,10 +442,10 @@ func (d *PostgresDestination) copyRecord(ctx context.Context, record arrow.Recor
 	if err != nil {
 		return 0, err
 	}
-	return copyPostgresRecord(ctx, pgxConn, record, opts.Schema, plan)
+	return copyPostgresRecord(ctx, pgxConn, record, opts.Schema, plan, rejects)
 }
 
-func (d *PostgresDestination) copyRecordGroup(ctx context.Context, record arrow.RecordBatch, records <-chan source.RecordBatchResult, opts destination.WriteOptions, copyPlans postgresCopyPlanCache) (int64, int, *source.RecordBatchResult, error) {
+func (d *PostgresDestination) copyRecordGroup(ctx context.Context, record arrow.RecordBatch, records <-chan source.RecordBatchResult, opts destination.WriteOptions, copyPlans postgresCopyPlanCache, rejects *rejectedRows) (int64, int, *source.RecordBatchResult, error) {
 	conn, err := d.pool.Acquire(ctx)
 	if err != nil {
 		record.Release()
@@ -443,11 +461,11 @@ func (d *PostgresDestination) copyRecordGroup(ctx context.Context, record arrow.
 	}
 	if !recordSupportsDirectPostgresCopy(record, plan.oids) {
 		defer record.Release()
-		rows, err := copyPostgresRecord(ctx, pgxConn, record, opts.Schema, plan)
+		rows, err := copyPostgresRecord(ctx, pgxConn, record, opts.Schema, plan, rejects)
 		return rows, 1, nil, err
 	}
 
-	stream, err := newPostgresRecordCopyStream(ctx, records, record, opts.Schema, pgxConn.TypeMap(), plan.oids)
+	stream, err := newPostgresRecordCopyStream(ctx, records, record, opts.Schema, pgxConn.TypeMap(), plan.oids, rejects)
 	if err != nil {
 		return 0, 0, nil, err
 	}
@@ -456,8 +474,8 @@ func (d *PostgresDestination) copyRecordGroup(ctx context.Context, record arrow.
 	return tag.RowsAffected(), stream.Batches(), stream.Pending(), err
 }
 
-func copyPostgresRecord(ctx context.Context, pgxConn *pgx.Conn, record arrow.RecordBatch, tableSchema *schema.TableSchema, plan *postgresCopyPlan) (int64, error) {
-	reader, ok := newArrowCopyReader(record, tableSchema, pgxConn.TypeMap(), plan.oids)
+func copyPostgresRecord(ctx context.Context, pgxConn *pgx.Conn, record arrow.RecordBatch, tableSchema *schema.TableSchema, plan *postgresCopyPlan, rejects *rejectedRows) (int64, error) {
+	reader, ok := newArrowCopyReader(record, tableSchema, pgxConn.TypeMap(), plan.oids, rejects)
 	if !ok {
 		getters := postgresValueGetters(record, tableSchema)
 		values := make([]any, record.NumCols())
